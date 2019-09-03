@@ -1,0 +1,7 @@
+{
+    "dependencies": {},
+    "description": "A NuGet Package Manager for Unity",
+    "displayName": "NuGet for Unity",
+    "name": "com.glitchenzo.nugetforunity",
+    "version": "1.2.1"
+}
