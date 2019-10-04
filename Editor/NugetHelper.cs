@@ -1,18 +1,18 @@
 ﻿namespace NugetForUnity
 {
+    using Ionic.Zip;
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.IO;
     using System.Linq;
     using System.Net;
+    using System.Security.Cryptography;
     using System.Text;
-    using Ionic.Zip;
+    using System.Text.RegularExpressions;
     using UnityEditor;
     using UnityEngine;
     using Debug = UnityEngine.Debug;
-    using System.Security.Cryptography;
-    using System.Text.RegularExpressions;
 
     /// <summary>
     /// A set of helper methods that act as a wrapper around nuget.exe
@@ -24,6 +24,8 @@
     [InitializeOnLoad]
     public static class NugetHelper
     {
+        private static bool insideInitializeOnLoad = false;
+
         /// <summary>
         /// The path to the nuget.config file.
         /// </summary>
@@ -95,29 +97,37 @@
         /// </summary>
         static NugetHelper()
         {
-            // if we are entering playmode, don't do anything
-            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            insideInitializeOnLoad = true;
+            try
             {
-                return;
-            }
+                // if we are entering playmode, don't do anything
+                if (EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    return;
+                }
 
 #if UNITY_5_6_OR_NEWER
-            DotNetVersion = PlayerSettings.GetApiCompatibilityLevel(EditorUserBuildSettings.selectedBuildTargetGroup);
+                DotNetVersion = PlayerSettings.GetApiCompatibilityLevel(EditorUserBuildSettings.selectedBuildTargetGroup);
 #else
             DotNetVersion = PlayerSettings.apiCompatibilityLevel;
 #endif
 
-            // Load the NuGet.config file
-            LoadNugetConfigFile();
+                // Load the NuGet.config file
+                LoadNugetConfigFile();
 
-            // create the nupkgs directory, if it doesn't exist
-            if (!Directory.Exists(PackOutputDirectory))
-            {
-                Directory.CreateDirectory(PackOutputDirectory);
+                // create the nupkgs directory, if it doesn't exist
+                if (!Directory.Exists(PackOutputDirectory))
+                {
+                    Directory.CreateDirectory(PackOutputDirectory);
+                }
+
+                // restore packages - this will be called EVERY time the project is loaded or a code-file changes
+                Restore();
             }
-
-            // restore packages - this will be called EVERY time the project is loaded or a code-file changes
-            Restore();
+            finally
+            {
+                insideInitializeOnLoad = false;
+            }
         }
 
         /// <summary>
@@ -142,7 +152,7 @@
             packageSources.Clear();
             bool readingSources = false;
             bool useCommandLineSources = false;
-            foreach (var arg in Environment.GetCommandLineArgs())
+            foreach (string arg in Environment.GetCommandLineArgs())
             {
                 if (readingSources)
                 {
@@ -273,19 +283,62 @@
             }
 
             string[] subdirectories = Directory.GetDirectories(directoryPath);
-            foreach (var subDir in subdirectories)
+            foreach (string subDir in subdirectories)
             {
                 FixSpaces(subDir);
             }
 
             string[] files = Directory.GetFiles(directoryPath);
-            foreach (var file in files)
+            foreach (string file in files)
             {
                 if (file.Contains("%20"))
                 {
                     LogVerbose("Removing %20 from {0}", file);
                     File.Move(file, file.Replace("%20", " "));
                 }
+            }
+        }
+
+        /// <summary>
+        /// Checks the file importer settings and disables the export to WSA Platform setting.
+        /// </summary>
+        /// <param name="filePath">The path to the .config file.</param>
+        /// <param name="notifyOfUpdate">Whether or not to log a warning of the update.</param>
+        public static void DisableWSAPExportSetting(string filePath, bool notifyOfUpdate)
+        {
+            string[] unityVersionParts = Application.unityVersion.Split('.');
+            int unityMajorVersion;
+            if (int.TryParse(unityVersionParts[0], out unityMajorVersion) && unityMajorVersion <= 2017)
+            {
+                return;
+            }
+
+            filePath = Path.GetFullPath(filePath);
+
+            string assetsLocalPath = filePath.Replace(Path.GetFullPath(Application.dataPath), "Assets");
+            PluginImporter importer = AssetImporter.GetAtPath(assetsLocalPath) as PluginImporter;
+
+            if (importer == null)
+            {
+                if (!insideInitializeOnLoad)
+                {
+                    Debug.LogError(string.Format("Couldn't get importer for '{0}'.", filePath));
+                }
+                return;
+            }
+
+            if (importer.GetCompatibleWithPlatform(BuildTarget.WSAPlayer))
+            {
+                if (notifyOfUpdate)
+                {
+                    Debug.LogWarning(string.Format("Disabling WSA platform on asset settings for {0}", filePath));
+                }
+                else
+                {
+                    LogVerbose("Disabling WSA platform on asset settings for {0}", filePath);
+                }
+
+                importer.SetCompatibleWithPlatform(BuildTarget.WSAPlayer, false);
             }
         }
 
@@ -331,11 +384,11 @@
                 bool using46 = intDotNetVersion == 3; // NET_4_6 = 3 in Unity 5.6 and Unity 2017.1 - use the hard-coded int value to ensure it works in earlier versions of Unity
                 bool usingStandard2 = intDotNetVersion == 6; // using .net standard 2.0                
 
-                var selectedDirectories = new List<string>();
+                List<string> selectedDirectories = new List<string>();
 
                 // go through the library folders in descending order (highest to lowest version)
-                var libDirectories = Directory.GetDirectories(packageInstallDirectory + "/lib").Select(s => new DirectoryInfo(s)).OrderByDescending(di => di.Name.ToLower());
-                foreach (var directory in libDirectories)
+                IOrderedEnumerable<DirectoryInfo> libDirectories = Directory.GetDirectories(packageInstallDirectory + "/lib").Select(s => new DirectoryInfo(s)).OrderByDescending(di => di.Name.ToLower());
+                foreach (DirectoryInfo directory in libDirectories)
                 {
                     string directoryName = directory.Name.ToLower();
 
@@ -450,15 +503,19 @@
                 }
 
 
-                foreach (var dir in selectedDirectories)
+                foreach (string dir in selectedDirectories)
                 {
                     LogVerbose("Using {0}", dir);
                 }
 
                 // delete all of the libaries except for the selected one
-                foreach (var directory in libDirectories)
+                foreach (DirectoryInfo directory in libDirectories)
                 {
-                    if (!selectedDirectories.Contains(directory.FullName))
+                    bool validDirectory = selectedDirectories
+                        .Where(d => string.Compare(d, directory.FullName, ignoreCase: true) == 0)
+                        .Any();
+
+                    if (!validDirectory)
                     {
                         DeleteDirectory(directory.FullName);
                     }
@@ -506,27 +563,7 @@
             {
                 string pluginsDirectory = Application.dataPath + "/Plugins/";
 
-                if (!Directory.Exists(pluginsDirectory))
-                {
-                    Directory.CreateDirectory(pluginsDirectory);
-                }
-
-                string[] files = Directory.GetFiles(packageInstallDirectory + "/unityplugin");
-                foreach (string file in files)
-                {
-                    string newFilePath = pluginsDirectory + Path.GetFileName(file);
-
-                    try
-                    {
-                        LogVerbose("Moving {0} to {1}", file, newFilePath);
-                        DeleteFile(newFilePath);
-                        File.Move(file, newFilePath);
-                    }
-                    catch (UnauthorizedAccessException)
-                    {
-                        Debug.LogWarningFormat("{0} couldn't be overwritten. It may be a native plugin already locked by Unity. Please close Unity and manually delete it.", newFilePath);
-                    }
-                }
+                DirectoryCopy(packageInstallDirectory + "/unityplugin", pluginsDirectory);
 
                 LogVerbose("Deleting {0}", packageInstallDirectory + "/unityplugin");
 
@@ -636,6 +673,54 @@
         }
 
         /// <summary>
+        /// Recursively copies all files and sub-directories from one directory to another.
+        /// </summary>
+        /// <param name="sourceDirectoryPath">The filepath to the folder to copy from.</param>
+        /// <param name="destDirectoryPath">The filepath to the folder to copy to.</param>
+        private static void DirectoryCopy(string sourceDirectoryPath, string destDirectoryPath)
+        {
+            DirectoryInfo dir = new DirectoryInfo(sourceDirectoryPath);
+            if (!dir.Exists)
+            {
+                throw new DirectoryNotFoundException(
+                    "Source directory does not exist or could not be found: "
+                    + sourceDirectoryPath);
+            }
+
+            // if the destination directory doesn't exist, create it
+            if (!Directory.Exists(destDirectoryPath))
+            {
+                LogVerbose("Creating new directory: {0}", destDirectoryPath);
+                Directory.CreateDirectory(destDirectoryPath);
+            }
+
+            // get the files in the directory and copy them to the new location
+            FileInfo[] files = dir.GetFiles();
+            foreach (FileInfo file in files)
+            {
+                string newFilePath = Path.Combine(destDirectoryPath, file.Name);
+
+                try
+                {
+                    LogVerbose("Moving {0} to {1}", file.ToString(), newFilePath);
+                    file.CopyTo(newFilePath, true);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarningFormat("{0} couldn't be moved to {1}. It may be a native plugin already locked by Unity. Please trying closing Unity and manually moving it. \n{2}", file.ToString(), newFilePath, e.ToString());
+                }
+            }
+
+            // copy sub-directories and their contents to new location
+            DirectoryInfo[] dirs = dir.GetDirectories();
+            foreach (DirectoryInfo subdir in dirs)
+            {
+                string temppath = Path.Combine(destDirectoryPath, subdir.Name);
+                DirectoryCopy(subdir.FullName, temppath);
+            }
+        }
+
+        /// <summary>
         /// Recursively deletes the folder at the given path.
         /// NOTE: Directory.Delete() doesn't delete Read-Only files, whereas this does.
         /// </summary>
@@ -643,19 +728,21 @@
         private static void DeleteDirectory(string directoryPath)
         {
             if (!Directory.Exists(directoryPath))
+            {
                 return;
+            }
 
-            var directoryInfo = new DirectoryInfo(directoryPath);
+            DirectoryInfo directoryInfo = new DirectoryInfo(directoryPath);
 
             // delete any sub-folders first
-            foreach (var childInfo in directoryInfo.GetFileSystemInfos())
+            foreach (FileSystemInfo childInfo in directoryInfo.GetFileSystemInfos())
             {
                 DeleteDirectory(childInfo.FullName);
             }
 
             // remove the read-only flag on all files
-            var files = directoryInfo.GetFiles();
-            foreach (var file in files)
+            FileInfo[] files = directoryInfo.GetFiles();
+            foreach (FileInfo file in files)
             {
                 file.Attributes = FileAttributes.Normal;
             }
@@ -688,7 +775,7 @@
         private static void DeleteAllFiles(string directoryPath, string extension)
         {
             string[] files = Directory.GetFiles(directoryPath, extension, SearchOption.AllDirectories);
-            foreach (var file in files)
+            foreach (string file in files)
             {
                 DeleteFile(file);
             }
@@ -699,7 +786,7 @@
         /// </summary>
         internal static void UninstallAll()
         {
-            foreach (var package in installedPackages.Values.ToList())
+            foreach (NugetPackage package in installedPackages.Values.ToList())
             {
                 Uninstall(package);
             }
@@ -730,7 +817,9 @@
             installedPackages.Remove(package.Id);
 
             if (refreshAssets)
+            {
                 AssetDatabase.Refresh();
+            }
         }
 
         /// <summary>
@@ -851,9 +940,9 @@
             List<NugetPackage> packages = new List<NugetPackage>();
 
             // Loop through all active sources and combine them into a single list
-            foreach (var source in packageSources.Where(s => s.IsEnabled))
+            foreach (NugetPackageSource source in packageSources.Where(s => s.IsEnabled))
             {
-                var newPackages = source.Search(searchTerm, includeAllVersions, includePrerelease, numberToGet, numberToSkip);
+                List<NugetPackage> newPackages = source.Search(searchTerm, includeAllVersions, includePrerelease, numberToGet, numberToSkip);
                 packages.AddRange(newPackages);
                 packages = packages.Distinct().ToList();
             }
@@ -875,9 +964,9 @@
             List<NugetPackage> packages = new List<NugetPackage>();
 
             // Loop through all active sources and combine them into a single list
-            foreach (var source in packageSources.Where(s => s.IsEnabled))
+            foreach (NugetPackageSource source in packageSources.Where(s => s.IsEnabled))
             {
-                var newPackages = source.GetUpdates(packagesToUpdate, includePrerelease, includeAllVersions, targetFrameworks, versionContraints);
+                List<NugetPackage> newPackages = source.GetUpdates(packagesToUpdate, includePrerelease, includeAllVersions, targetFrameworks, versionContraints);
                 packages.AddRange(newPackages);
                 packages = packages.Distinct().ToList();
             }
@@ -977,9 +1066,9 @@
             NugetPackage package = null;
 
             // Loop through all active sources and stop once the package is found
-            foreach (var source in packageSources.Where(s => s.IsEnabled))
+            foreach (NugetPackageSource source in packageSources.Where(s => s.IsEnabled))
             {
-                var foundPackage = source.GetSpecificPackage(packageId);
+                NugetPackage foundPackage = source.GetSpecificPackage(packageId);
                 if (foundPackage == null)
                 {
                     continue;
@@ -1056,10 +1145,10 @@
         /// <param name="args">The arguments for the formattted message string.</param>
         public static void LogVerbose(string format, params object[] args)
         {
-            if (NugetConfigFile.Verbose)
+            if (NugetConfigFile == null || NugetConfigFile.Verbose)
             {
 #if UNITY_5_4_OR_NEWER
-                var stackTraceLogType = Application.GetStackTraceLogType(LogType.Log);
+                StackTraceLogType stackTraceLogType = Application.GetStackTraceLogType(LogType.Log);
                 Application.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
 #else
                 var stackTraceLogType = Application.stackTraceLogType;
@@ -1110,16 +1199,18 @@
 
 
                 if (refreshAssets)
+                {
                     EditorUtility.DisplayProgressBar(string.Format("Installing {0} {1}", package.Id, package.Version), "Installing Dependencies", 0.1f);
+                }
 
                 // install all dependencies
-                foreach (var dependency in package.Dependencies)
+                foreach (NugetPackageIdentifier dependency in package.Dependencies)
                 {
                     LogVerbose("Installing Dependency: {0} {1}", dependency.Id, dependency.Version);
                     bool installed = InstallIdentifier(dependency);
                     if (!installed)
                     {
-                        throw new Exception(String.Format("Failed to install dependency: {0} {1}.", dependency.Id, dependency.Version));
+                        throw new Exception(string.Format("Failed to install dependency: {0} {1}.", dependency.Id, dependency.Version));
                     }
                 }
 
@@ -1158,7 +1249,9 @@
                         LogVerbose("Downloading package {0} {1}", package.Id, package.Version);
 
                         if (refreshAssets)
+                        {
                             EditorUtility.DisplayProgressBar(string.Format("Installing {0} {1}", package.Id, package.Version), "Downloading Package", 0.3f);
+                        }
 
                         Stream objStream = RequestUrl(package.DownloadUrl, package.PackageSource.UserName, package.PackageSource.ExpandedPassword, timeOut: null);
                         using (Stream file = File.Create(cachedPackagePath))
@@ -1169,7 +1262,9 @@
                 }
 
                 if (refreshAssets)
+                {
                     EditorUtility.DisplayProgressBar(string.Format("Installing {0} {1}", package.Id, package.Version), "Extracting Package", 0.6f);
+                }
 
                 if (File.Exists(cachedPackagePath))
                 {
@@ -1198,7 +1293,9 @@
                 }
 
                 if (refreshAssets)
+                {
                     EditorUtility.DisplayProgressBar(string.Format("Installing {0} {1}", package.Id, package.Version), "Cleaning Package", 0.9f);
+                }
 
                 // clean
                 Clean(package);
@@ -1328,11 +1425,11 @@
                 float currentProgress = 0;
 
                 // copy the list since the InstallIdentifier operation below changes the actual installed packages list
-                var packagesToInstall = new List<NugetPackageIdentifier>(PackagesConfigFile.Packages);
+                List<NugetPackageIdentifier> packagesToInstall = new List<NugetPackageIdentifier>(PackagesConfigFile.Packages);
 
                 LogVerbose("Restoring {0} packages.", packagesToInstall.Count);
 
-                foreach (var package in packagesToInstall)
+                foreach (NugetPackageIdentifier package in packagesToInstall)
                 {
                     if (package != null)
                     {
@@ -1371,16 +1468,18 @@
         internal static void CheckForUnnecessaryPackages()
         {
             if (!Directory.Exists(NugetConfigFile.RepositoryPath))
-                return;
-
-            var directories = Directory.GetDirectories(NugetConfigFile.RepositoryPath, "*", SearchOption.TopDirectoryOnly);
-            foreach (var folder in directories)
             {
-                var name = Path.GetFileName(folder);
-                var installed = false;
-                foreach (var package in PackagesConfigFile.Packages)
+                return;
+            }
+
+            string[] directories = Directory.GetDirectories(NugetConfigFile.RepositoryPath, "*", SearchOption.TopDirectoryOnly);
+            foreach (string folder in directories)
+            {
+                string name = Path.GetFileName(folder);
+                bool installed = false;
+                foreach (NugetPackageIdentifier package in PackagesConfigFile.Packages)
                 {
-                    var packageName = string.Format("{0}.{1}", package.Id, package.Version);
+                    string packageName = string.Format("{0}.{1}", package.Id, package.Version);
                     if (name == packageName)
                     {
                         installed = true;
@@ -1459,7 +1558,9 @@
                     LogVerbose("Downloading image {0} took {1} ms", url, stopwatch.ElapsedMilliseconds);
                 }
                 else
+                {
                     LogVerbose("Request error: " + request.error);
+                }
             }
 
 
@@ -1491,7 +1592,10 @@
         private static string GetHash(string s)
         {
             if (string.IsNullOrEmpty(s))
+            {
                 return null;
+            }
+
             MD5CryptoServiceProvider md5 = new MD5CryptoServiceProvider();
             byte[] data = md5.ComputeHash(Encoding.Default.GetBytes(s));
             StringBuilder sBuilder = new StringBuilder();
@@ -1526,7 +1630,7 @@
 
         private static void DownloadCredentialProviders(Uri feedUri)
         {
-            foreach (var feed in NugetHelper.knownAuthenticatedFeeds)
+            foreach (AuthenticatedFeed feed in NugetHelper.knownAuthenticatedFeeds)
             {
                 string account = feed.GetAccount(feedUri.ToString());
                 if (string.IsNullOrEmpty(account)) { continue; }
@@ -1548,7 +1652,7 @@
                     }
 
                     string providerDestination = Environment.GetEnvironmentVariable("NUGET_CREDENTIALPROVIDERS_PATH");
-                    if (String.IsNullOrEmpty(providerDestination))
+                    if (string.IsNullOrEmpty(providerDestination))
                     {
                         providerDestination = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Nuget/CredentialProviders");
                     }
@@ -1636,8 +1740,10 @@
 
             // Build the list of possible locations to find the credential provider. In order it should be local app data, paths set on the
             // environment varaible, and lastly look at the root of the pacakges save location.
-            List<string> possibleCredentialProviderPaths = new List<string>();
-            possibleCredentialProviderPaths.Add(Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Nuget"), "CredentialProviders"));
+            List<string> possibleCredentialProviderPaths = new List<string>
+            {
+                Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Nuget"), "CredentialProviders")
+            };
 
             string environmentCredentialProviderPaths = Environment.GetEnvironmentVariable("NUGET_CREDENTIALPROVIDERS_PATH");
             if (!string.IsNullOrEmpty(environmentCredentialProviderPaths))
@@ -1651,7 +1757,7 @@
             possibleCredentialProviderPaths.Add(toolsPackagesFolder);
 
             // Search through all possible paths to find the credential provider.
-            var providerPaths = new List<string>();
+            List<string> providerPaths = new List<string>();
             foreach (string possiblePath in possibleCredentialProviderPaths)
             {
                 if (Directory.Exists(possiblePath))
@@ -1660,7 +1766,7 @@
                 }
             }
 
-            foreach (var providerPath in providerPaths.Distinct())
+            foreach (string providerPath in providerPaths.Distinct())
             {
                 // Launch the credential provider executable and get the json encoded response from the std output
                 Process process = new Process();
@@ -1684,23 +1790,23 @@
                 {
                     case CredentialProviderExitCode.ProviderNotApplicable: break; // Not the right provider
                     case CredentialProviderExitCode.Failure: // Right provider, failure to get creds
-                        {
-                            Debug.LogErrorFormat("Failed to get credentials from {0}!\n\tOutput\n\t{1}\n\tErrors\n\t{2}", providerPath, output, errors);
-                            return null;
-                        }
+                    {
+                        Debug.LogErrorFormat("Failed to get credentials from {0}!\n\tOutput\n\t{1}\n\tErrors\n\t{2}", providerPath, output, errors);
+                        return null;
+                    }
                     case CredentialProviderExitCode.Success:
-                        {
-                            return JsonUtility.FromJson<CredentialProviderResponse>(output);
-                        }
+                    {
+                        return JsonUtility.FromJson<CredentialProviderResponse>(output);
+                    }
                     default:
-                        {
-                            Debug.LogWarningFormat("Unrecognized exit code {0} from {1} {2}", process.ExitCode, providerPath, process.StartInfo.Arguments);
-                            break;
-                        }
+                    {
+                        Debug.LogWarningFormat("Unrecognized exit code {0} from {1} {2}", process.ExitCode, providerPath, process.StartInfo.Arguments);
+                        break;
+                    }
                 }
             }
 
-            if(downloadIfMissing)
+            if (downloadIfMissing)
             {
                 DownloadCredentialProviders(feedUri);
                 return GetCredentialFromProvider_Uncached(feedUri, false);
